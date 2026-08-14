@@ -242,7 +242,9 @@ async def start_duvri_pipeline(payload: dict, background_tasks: BackgroundTasks)
     payload['risk_scores'] = risk_scores
     payload['today_date'] = today_date
     
+    # 3. SAVE TO SUPABASE DB & START AGENTS (Added user_id to fix the 500 error)
     response = supabase.table("jobs").insert({
+        "user_id": payload.get("user_id"),
         "status": "PROCESSING",
         "email": payload.get("email", "unknown@example.com"),
         "document_type": "DUVRI",
