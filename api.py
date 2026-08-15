@@ -163,4 +163,192 @@ def generate_duvri_docx(data):
     sig_table.rows[0].cells[1].text = '___________________________'
     sig_table.rows[1].cells[0].text = 'Il Committente'
     sig_table.rows[1].cells[1].text = "L'Appaltatore"
-    sig_table.rows[1].cells[0].paragraphs[
+    sig_table.rows[1].cells[0].paragraphs[0].runs[0].font.bold = True
+    sig_table.rows[1].cells[1].paragraphs[0].runs[0].font.bold = True
+    sig_table.rows[2].cells[0].text = data['host_company']
+    sig_table.rows[2].cells[1].text = data['contractor_name']
+    
+    doc.add_page_break()
+    
+    # === ALLEGATO A ===
+    doc.add_heading('Allegato A — Estratto Normativo (Art. 26, D.Lgs 81/08)', level=1)
+    
+    legal_articles = [
+        ("Art. 26, comma 1:", "Il datore di lavoro committente verifica l'idoneità tecnico-professionale delle imprese appaltatrici e fornisce dettagliate informazioni sui rischi specifici esistenti nell'ambiente e sulle misure di prevenzione e di emergenza adottate."),
+        ("Art. 26, comma 3:", "Il datore di lavoro committente elabora un unico documento di valutazione dei rischi che indichi le misure adottate per eliminare o, ove ciò non è possibile, ridurre al minimo i rischi da interferenze. Il documento è allegato al contratto di appalto o di opera e deve essere adeguato in funzione dell'evoluzione dei lavori, servizi e forniture."),
+        ("Art. 26, comma 3-ter:", "Il soggetto che affida il contratto redige il documento di valutazione dei rischi da interferenze recante una valutazione ricognitiva dei rischi standard relativi alla tipologia della prestazione."),
+        ("Art. 26, comma 5:", "Nei contratti devono essere specificamente indicati i costi delle misure adottate per eliminare o ridurre al minimo i rischi da interferenze. Tali costi non sono soggetti a ribasso."),
+        ("Art. 55, comma 5, lett. d):", "Sanzione per mancata redazione del DUVRI: Arresto da due a quattro mesi o ammenda da € 1.500 a € 6.000.")
+    ]
+    
+    for title, text in legal_articles:
+        p = doc.add_paragraph()
+        p.add_run(title).bold = True
+        p.add_run(' ' + text)
+        p.paragraph_format.left_indent = Inches(0.2)
+        p.paragraph_format.space_after = Pt(8)
+    
+    # Footer
+    doc.add_paragraph()
+    footer = doc.add_paragraph('Documento generato da Adempere — AI Compliance Platform. Questo DUVRI deve essere allegato al contratto di appalto e aggiornato in funzione dell\'evoluzione dei lavori (Art. 26, comma 3, D.Lgs 81/08).')
+    footer.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    footer.runs[0].font.size = Pt(8)
+    footer.runs[0].font.italic = True
+    footer.runs[0].font.color.rgb = RGBColor(128, 128, 128)
+    
+    # Save to buffer
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+@app.post("/api/start-duvri")
+async def start_duvri_pipeline(payload: dict, background_tasks: BackgroundTasks):
+    try:
+        risks_input = payload.get('risks', [])
+        work_type = payload.get('work_type', 'General Maintenance')
+        
+        risk_translation = {
+            "work at heights": "Lavori in quota",
+            "electrocution": "Rischio Elettrico (Folgorazione)",
+            "noise": "Rumore",
+            "chemical agents": "Agenti Chimici",
+            "confined spaces": "Spazi Confinati",
+            "manual handling": "Movimentazione Manuale dei Carichi"
+        }
+        
+        risk_scores = {}
+        for risk in risks_input:
+            risk_it = risk_translation.get(risk.lower(), risk.title())
+            if 'quota' in risk_it.lower() or 'height' in risk.lower():
+                p, m = 3, 4
+            elif 'chimic' in risk_it.lower() or 'chemical' in risk.lower():
+                p, m = 2, 3
+            elif 'rumore' in risk_it.lower() or 'noise' in risk.lower():
+                p, m = 4, 2
+            elif 'elettric' in risk_it.lower() or 'electric' in risk.lower():
+                p, m = 2, 4
+            else:
+                p, m = 3, 3
+            
+            score = p * m
+            risk_scores[risk_it] = {"P": p, "M": m, "Score": score}
+            
+    except Exception as e:
+        return {"error": f"Invalid input format: {str(e)}"}
+    
+    today_date = datetime.now().strftime("%d/%m/%Y")
+    payload['risks_it'] = list(risk_scores.keys())
+    payload['risk_scores'] = risk_scores
+    payload['today_date'] = today_date
+    
+    # SAVE TO SUPABASE DB & START AGENTS (Changed to 'documents' table)
+    response = supabase.table("documents").insert({
+        "user_id": payload.get("user_id"),
+        "status": "PROCESSING",
+        "email": payload.get("email", "unknown@example.com"),
+        "document_type": "DUVRI",
+        "intake_answers": payload
+    }).execute()
+    job_id = response.data[0]['id']
+    
+    background_tasks.add_task(run_duvri_task, job_id, payload)
+    return {"job_id": job_id, "status": "PROCESSING"}
+
+@app.get("/api/status/{job_id}")
+def get_status(job_id: str):
+    # Changed to 'documents' table
+    response = supabase.table("documents").select("status, pdf_url, error").eq("id", job_id).execute()
+    if response.data:
+        return response.data[0]
+    return {"error": "Job not found"}
+
+def run_duvri_task(job_id: str, frontend_json: dict):
+    try:
+        print(f"[{job_id}] Starting DUVRI Pipeline...")
+        context_block = get_context_block()
+        draft_json = draft_duvri(frontend_json, context_block)
+        
+        # AI PROOFREADING
+        draft_string = json.dumps(draft_json, ensure_ascii=False)
+        draft_string = draft_string.replace("c. c.", "c.c.")
+        draft_string = draft_string.replace(". .", ".")
+        draft_string = draft_string.replace("..", ".")
+        draft_string = draft_string.replace("  ", " ")
+        draft_json = json.loads(draft_string)
+        
+        # AGENT REVIEWER
+        print(f"[{job_id}] Reviewing DUVRI for compliance...")
+        corrected_json = review_duvri(draft_json, frontend_json, context_block)
+        corrected_json.pop("review_notes", None)
+        draft_json = corrected_json
+
+        # MAP DATA FOR DOCX (Safe .get() fallbacks to prevent KeyError crashes)
+        risks_list = []
+        for risk_name, scores in frontend_json.get('risk_scores', {}).items():
+            score = scores['Score']
+            if score <= 4:
+                level = "Basso"
+            elif score <= 9:
+                level = "Medio"
+            else:
+                level = "Alto"
+                
+            risks_list.append({
+                'name': risk_name,
+                'probability': scores['P'],
+                'magnitude': scores['M'],
+                'score': score,
+                'level': level
+            })
+            
+        pdf_data = {
+            'host_company': frontend_json.get('host_company', 'N/D'),
+            'host_vat': frontend_json.get('host_vat', 'N/D'),
+            'work_site': frontend_json.get('work_site_address', 'N/D'),
+            'contractor_name': frontend_json.get('contractor_name', 'N/D'),
+            'contractor_vat': frontend_json.get('contractor_vat', 'N/D'),
+            'work_type': frontend_json.get('work_type', 'N/D'),
+            'start_date': frontend_json.get('start_date', 'N/D'),
+            'end_date': frontend_json.get('end_date', 'N/D'),
+            'valutazione_text': draft_json.get('valutazione_ricognitiva', ''),
+            'misure_text': draft_json.get('risk_measures', ''),
+            'costi_text': draft_json.get('safety_costs', ''),
+            'coordination_text': draft_json.get('coordination_procedures', ''),
+            'risks': risks_list
+        }
+        
+        # GENERATE DOCX
+        try:
+            print(f"[{job_id}] Converting to DOCX...")
+            docx_bytes = generate_duvri_docx(pdf_data)
+        except Exception as docx_err:
+            print(f"[{job_id}] DOCX Generation Failed: {str(docx_err)}")
+            raise docx_err
+        
+        file_name = f"DUVRI_{pdf_data['contractor_name'].replace(' ', '_')}_{job_id}.docx"
+        print(f"[{job_id}] Uploading to Supabase Storage...")
+        supabase.storage.from_("dvr-documents").upload(
+            file_name, 
+            docx_bytes, 
+            file_options={"content-type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document"}
+        )
+        
+        public_url = supabase.storage.from_("dvr-documents").get_public_url(file_name)
+        
+        print(f"[{job_id}] Updating DB with DOCX URL...")
+        # Changed to 'documents' table
+        supabase.table("documents").update({
+            "status": "COMPLETED",
+            "pdf_url": public_url  # Keeping column name pdf_url for frontend compatibility
+        }).eq("id", job_id).execute()
+        
+        print(f"[{job_id}] DUVRI Complete!")
+        
+    except Exception as e:
+        print(f"[{job_id}] Error: {str(e)}")
+        # Changed to 'documents' table
+        supabase.table("documents").update({
+            "status": "FAILED",
+            "error": str(e)
+        }).eq("id", job_id).execute()
