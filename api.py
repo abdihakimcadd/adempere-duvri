@@ -21,12 +21,13 @@ from agent_reviewer import review_duvri
 
 app = FastAPI()
 
-# UPDATED CORS TO FIX THE NETWORK ERROR
+# UPDATED CORS TO FIX THE NETWORK ERROR (Added Lovable preview URL)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://adempere.com", 
         "https://www.adempere.com",
+        "https://easy-deal-vista.lovable.app",  # Lovable Preview URL
         "http://localhost:3000",
         "http://localhost:5173"
     ],
@@ -242,7 +243,7 @@ async def start_duvri_pipeline(payload: dict, background_tasks: BackgroundTasks)
     payload['risk_scores'] = risk_scores
     payload['today_date'] = today_date
     
-    # SAVE TO SUPABASE DB & START AGENTS (Changed to 'documents' table)
+    # SAVE TO SUPABASE DB & START AGENTS (Using 'documents' table)
     response = supabase.table("documents").insert({
         "user_id": payload.get("user_id"),
         "status": "PROCESSING",
@@ -257,7 +258,7 @@ async def start_duvri_pipeline(payload: dict, background_tasks: BackgroundTasks)
 
 @app.get("/api/status/{job_id}")
 def get_status(job_id: str):
-    # Changed to 'documents' table
+    # Using 'documents' table
     response = supabase.table("documents").select("status, pdf_url, error").eq("id", job_id).execute()
     if response.data:
         return response.data[0]
@@ -337,7 +338,7 @@ def run_duvri_task(job_id: str, frontend_json: dict):
         public_url = supabase.storage.from_("dvr-documents").get_public_url(file_name)
         
         print(f"[{job_id}] Updating DB with DOCX URL...")
-        # Changed to 'documents' table
+        # Using 'documents' table
         supabase.table("documents").update({
             "status": "COMPLETED",
             "pdf_url": public_url  # Keeping column name pdf_url for frontend compatibility
@@ -347,7 +348,7 @@ def run_duvri_task(job_id: str, frontend_json: dict):
         
     except Exception as e:
         print(f"[{job_id}] Error: {str(e)}")
-        # Changed to 'documents' table
+        # Using 'documents' table
         supabase.table("documents").update({
             "status": "FAILED",
             "error": str(e)
